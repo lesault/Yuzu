@@ -14,7 +14,8 @@ This document covers Yuzu server deployment, configuration, and ongoing administ
 6. [User Management](#user-management)
 7. [Agent Enrollment](#agent-enrollment)
 8. [OTA Agent Updates](#ota-agent-updates)
-9. [RBAC Management](#rbac-management)
+9. [Vulnerability Rule Management](#vulnerability-rule-management)
+10. [RBAC Management](#rbac-management)
 10. [Tag Compliance](#tag-compliance)
 11. [OIDC SSO Configuration](#oidc-sso-configuration)
 12. [Data Storage and Encryption](#data-storage-and-encryption)
@@ -46,6 +47,8 @@ The Yuzu server binary accepts the following command-line flags. All flags are o
 | `--management-cert` | *(none)* | Optional PEM cert for the **management listener** (port 50052 by default). If unset, the management listener reuses the agent listener's certificate. |
 | `--management-key` | *(none)* | Optional PEM key for the management listener. If `--management-cert`/`--management-key` are set without `--management-ca-cert`, the same `--insecure-skip-client-verify` + `YUZU_ALLOW_INSECURE_TLS=1` gate applies. |
 | `--management-ca-cert` | *(none)* | Optional CA cert for management client cert verification. Without this (and without `--insecure-skip-client-verify`), the management listener refuses to start. |
+| `--trusted-nat-cidr` | *(none)* | Comma-separated (or repeatable) CIDR ranges (IPv4 or IPv6) declaring a trusted NAT boundary for **direct-connect** agents. When an agent's Register and Subscribe source IPs *both* fall within one declared range, a per-session peer-IP mismatch is downgraded from a hard reject to an *advisory* (audit `result="ok" outcome=advisory`; counted on `yuzu_grpc_subscribe_peer_advisory_total`) instead of rejecting the stream. Strict exact-match is the default when absent; mismatches outside every declared range still reject (the stolen-session guard stays intact). Use for fleets behind multi-egress NAT, proxy pools, CG-NAT, or SD-WAN where an agent may egress from different public IPs on its two connections. **Security note:** declaring a range asserts the hosts in it are mutually trusted not to replay each other's sessions; keep ranges as narrow as possible (never `0.0.0.0/0`). Malformed entries are logged and ignored at startup. Env: `YUZU_TRUSTED_NAT_CIDR`. |
+| `--nat-trust-mtls-identity` | off | Also downgrade a peer-IP mismatch to advisory when the Subscribe mTLS client identity matches the identity bound at Register (#1128). **SAFE ONLY WITH PER-AGENT CLIENT CERTIFICATES.** With a shared/fleet-wide client cert every identity "matches", turning this into a session-replay bypass (an insider agent could hijack another agent's session from its own IP). Off by default; enable only if each agent presents a unique client certificate. When both `--nat-trust-mtls-identity` and `--trusted-nat-cidr` are configured, mTLS-identity match takes precedence: a session whose mTLS identity matches records `reason=mtls_identity_match` (visible on the audit `detail` and the `yuzu_grpc_subscribe_peer_advisory_total{reason=...}` label), and CIDR containment is not consulted for that session. Enabling the flag emits a `warn`-level startup line — confirm it appears in the boot log so the operator who pulled the lever can sign off on the per-agent-cert posture. Env: `YUZU_NAT_TRUST_MTLS_IDENTITY`. |
 | `--https-port` | `8443` | HTTPS listen port. |
 | `--https-cert` | *(none)* | Path to PEM-encoded TLS certificate file. Required unless `--no-https` is set. |
 | `--https-key` | *(none)* | Path to PEM-encoded TLS private key file. Required unless `--no-https` is set. The file must not be world-readable (Unix: `chmod 600`). |
@@ -647,6 +650,89 @@ The server can distribute agent binary updates to enrolled endpoints.
 - View all uploaded versions with their upload date, size, and promotion status.
 - Delete old versions to reclaim storage.
 - Only one version can be promoted (active) at a time.
+
+---
+
+## Vulnerability Rule Management
+
+The `vuln_scan` plugin uses a ruleset of known CVEs to detect vulnerable software and kernel versions. Rules are loaded at runtime from a JSON file, allowing updates without agent restart.
+
+### Automatic Weekly Rule Updates
+
+The Yuzu GitHub repository includes a weekly GitHub Actions workflow (`.github/workflows/update-cve-rules.yml`) that automatically:
+
+1. Fetches the latest CVE data from the NIST NVD API v2 (31 product keywords)
+2. Filters by severity (default: HIGH and CRITICAL)
+3. Generates `content/cve_rules.json` with the latest rules
+4. Validates the JSON schema and test-loads into the plugin
+5. Opens a pull request for review before merging
+
+**Workflow schedule:** Every Sunday at 02:00 UTC, or via manual trigger.
+
+**To use automated updates:**
+- Enable GitHub Actions in your Yuzu fork
+- Optionally, set the `NVD_API_KEY` repository secret to increase the NVD API rate limit from 5 req/30s to 50 req/30s (free key available at https://nvd.nist.gov/developers/api/key-request)
+- Merged rule updates are published as GitHub Releases and can be downloaded for offline deployment
+
+### Manual Rule Generation (Air-Gapped Deployments)
+
+For deployments without GitHub Actions access, use the standalone rule generator:
+
+```bash
+python3 scripts/generate-cve-rules.py --min-severity HIGH
+```
+
+This generates `content/cve_rules.json` and `content/cve_rules.json.sha256` for offline deployment.
+
+### Deploying Rule Updates to Endpoints
+
+Once you have a new `cve_rules.json`:
+
+1. Stage the file using the `content_dist.stage` action:
+   ```
+   InstructionSet: content_distribution
+   Action: stage
+   Parameters:
+     url: https://yourserver/path/to/cve_rules.json
+     filename: cve_rules.json
+     sha256: <hash from cve_rules.json.sha256>
+   ```
+
+2. Send the `vuln_scan.update_rules` action to trigger reload:
+   ```
+   InstructionSet: vuln_scan
+   Action: update_rules
+   ```
+
+3. After ~30 seconds, the new rules are active on all target endpoints. The plugin verifies the SHA-256 before loading to prevent tampering.
+
+**Built-in fallback:** If the staged JSON file is unavailable or fails verification, endpoints retain their compiled-in critical CVE ruleset, ensuring continuous protection.
+
+### Rule Format and Validation
+
+Rules use the `yuzu.vuln` schema (version 1):
+
+```json
+{
+  "schema_version": 1,
+  "rules": [
+    {
+      "cve_id": "CVE-2024-0001",
+      "product": "openssl",
+      "affected_below": "3.0.4",
+      "fixed_in": "3.0.4",
+      "severity": "CRITICAL",
+      "description": "Buffer overflow in X509 parsing"
+    }
+  ]
+}
+```
+
+Validate locally before deployment:
+
+```bash
+python3 scripts/generate-cve-rules.py --validate-only
+```
 
 ---
 

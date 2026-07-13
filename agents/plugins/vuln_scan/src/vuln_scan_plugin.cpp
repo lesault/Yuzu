@@ -19,11 +19,16 @@
 #include <array>
 #include <cctype>
 #include <cstdio>
+#include <fstream>
 #include <format>
 #include <map>
+#include <memory>
+#include <mutex>
 #include <string>
 #include <string_view>
 #include <vector>
+
+#include <openssl/evp.h>
 
 #if defined(__linux__) || defined(__APPLE__)
 #include <sstream>
@@ -39,10 +44,76 @@
 #include <windows.h>
 #endif
 
+#include "binary_version.hpp"
+#include "cis_checks.hpp"
 #include "config_checks.hpp"
 #include "cve_rules.hpp"
+#include "kernel_detection.hpp"
+#include "pkg_scan.hpp"
 
 namespace {
+
+// ── Plugin-scoped runtime state ────────────────────────────────────────────
+
+std::string g_data_dir;
+std::mutex g_dynamic_rules_mutex;
+std::shared_ptr<std::vector<yuzu::vuln::CveRuleDynamic>> g_dynamic_rules;
+
+// Verify SHA-256 of rules file against sidecar .sha256 file
+static bool verify_rules_sha256(const std::string& rules_path) {
+    auto sha_path = rules_path + ".sha256";
+    std::ifstream rules_f(rules_path, std::ios::binary);
+    std::ifstream sha_f(sha_path);
+    if (!rules_f || !sha_f)
+        return false;
+
+    // Read expected SHA-256 from sidecar
+    std::string line;
+    if (!std::getline(sha_f, line))
+        return false;
+    // Sidecar format: "<hex_digest>  <filename>"
+    auto space_pos = line.find("  ");
+    if (space_pos == std::string::npos || space_pos == 0)
+        return false;
+    std::string expected_hex = line.substr(0, space_pos);
+    if (expected_hex.length() != 64)  // SHA-256 is 256 bits = 64 hex chars
+        return false;
+
+    // Compute actual SHA-256 of rules file
+    rules_f.seekg(0);
+    EVP_MD_CTX *mdctx = EVP_MD_CTX_new();
+    if (!mdctx)
+        return false;
+
+    if (EVP_DigestInit_ex(mdctx, EVP_sha256(), nullptr) <= 0) {
+        EVP_MD_CTX_free(mdctx);
+        return false;
+    }
+
+    std::array<char, 4096> buf{};
+    while (rules_f.read(buf.data(), buf.size()) || rules_f.gcount() > 0) {
+        if (EVP_DigestUpdate(mdctx, buf.data(), static_cast<size_t>(rules_f.gcount())) <= 0) {
+            EVP_MD_CTX_free(mdctx);
+            return false;
+        }
+    }
+
+    unsigned char digest[EVP_MAX_MD_SIZE]{};
+    unsigned int digest_len = 0;
+    if (EVP_DigestFinal_ex(mdctx, digest, &digest_len) <= 0 || digest_len != 32) {
+        EVP_MD_CTX_free(mdctx);
+        return false;
+    }
+    EVP_MD_CTX_free(mdctx);
+
+    // Convert computed digest to hex and compare
+    std::array<char, 65> actual_hex{};
+    for (unsigned i = 0; i < digest_len; i++) {
+        snprintf(actual_hex.data() + (i * 2), 3, "%02x", digest[i]);
+    }
+
+    return expected_hex == std::string_view(actual_hex.data(), 64);
+}
 
 // ── Subprocess helper (Linux / macOS) ──────────────────────────────────────
 
@@ -307,7 +378,15 @@ std::vector<AppInfo> get_installed_apps() {
         while (std::getline(ss, line)) {
             auto sp = line.find(' ');
             if (sp != std::string::npos) {
-                apps.push_back({line.substr(0, sp), line.substr(sp + 1)});
+                std::string name = line.substr(0, sp);
+                std::string versions_str = line.substr(sp + 1);
+                // brew list --versions can output multiple versions: "python@3.11 3.11.15_1 3.12.8"
+                // Split on spaces to get each version and create a separate AppInfo for each
+                std::istringstream version_ss(versions_str);
+                std::string version;
+                while (version_ss >> version) {
+                    apps.push_back({name, version});
+                }
             }
         }
     }
@@ -335,36 +414,143 @@ std::vector<Finding> do_cve_scan_impl() {
     std::vector<Finding> findings;
     auto apps = get_installed_apps();
 
-    for (const auto& rule : yuzu::vuln::kCveRules) {
+    // Match one app against one rule; uses normalized comparison for
+    // Debian epoch, RPM/Alpine release suffix, and semver pre-release.
+    auto match_rule = [&](std::string_view product, std::string_view affected_below,
+                          std::string_view severity, std::string_view cve_id,
+                          std::string_view description, std::string_view fixed_in, bool affected_inclusive) {
         for (const auto& app : apps) {
-            if (!icontains(app.name, rule.product))
+            if (!icontains(app.name, product) || app.version.empty())
                 continue;
-            if (app.version.empty())
-                continue;
-
-            // Check if installed version is below the fixed version
-            if (yuzu::vuln::compare_versions(app.version, rule.affected_below) < 0) {
+            int cmp = yuzu::vuln::compare_versions_normalized(app.version, std::string(affected_below));
+            if (cmp < 0 || (cmp == 0 && affected_inclusive)) {
                 findings.push_back(
-                    {std::string(rule.severity), "cve",
-                     std::format("{}: {}", rule.cve_id, rule.description),
-                     std::format("{} {} (fixed in {})", app.name, app.version, rule.fixed_in)});
+                    {std::string(severity), "cve",
+                     std::format("{}: {}", cve_id, description),
+                     std::format("{} {} (fixed in {})", app.name, app.version, fixed_in)});
             }
+        }
+    };
+
+    for (const auto& r : yuzu::vuln::kCveRules)
+        match_rule(r.product, r.affected_below, r.severity, r.cve_id, r.description, r.fixed_in, r.affected_inclusive);
+
+    // Safely copy dynamic rules ptr while holding lock
+    auto dynamic = [&]() {
+        std::lock_guard<std::mutex> lock(g_dynamic_rules_mutex);
+        return g_dynamic_rules;
+    }();
+    if (dynamic) {
+        for (const auto& r : *dynamic) {
+            // Skip ecosystem-tagged rules (npm, PyPI, etc.) — handled by pkg_scan
+            // cve_scan matches only OS-native rules (ecosystem="")
+            if (!r.ecosystem.empty())
+                continue;
+            match_rule(r.product, r.affected_below, r.severity, r.cve_id, r.description, r.fixed_in, r.affected_inclusive);
         }
     }
 
     return findings;
 }
 
-// ── Config scan ───────────────────────────────────────────────────────────
+// ── Kernel CVE scan ────────────────────────────────────────────────────────
+
+std::vector<Finding> do_kernel_scan_impl() {
+    std::vector<Finding> findings;
+    auto ki = yuzu::vuln::get_kernel_info();
+    if (ki.full_version.empty())
+        return findings;
+
+    // Kernel rules use product tokens "linux-kernel", "windows-kernel", or "macos".
+    std::string product = ki.platform == "linux"   ? "linux-kernel" :
+                          ki.platform == "windows" ? "windows-kernel" : "macos";
+
+    auto match_rule = [&](std::string_view rule_product, std::string_view affected_below,
+                          std::string_view severity, std::string_view cve_id,
+                          std::string_view description, std::string_view fixed_in, bool affected_inclusive) {
+        if (!icontains(product, rule_product))
+            return;
+        int cmp = yuzu::vuln::compare_versions_normalized(ki.full_version, std::string(affected_below));
+        if (cmp < 0 || (cmp == 0 && affected_inclusive)) {
+            findings.push_back(
+                {std::string(severity), "kernel",
+                 std::format("{}: {}", cve_id, description),
+                 std::format("{} {} (fixed in {})", product, ki.full_version, fixed_in)});
+        }
+    };
+
+    for (const auto& r : yuzu::vuln::kCveRules)
+        match_rule(r.product, r.affected_below, r.severity, r.cve_id, r.description, r.fixed_in, r.affected_inclusive);
+    // Safely access dynamic rules
+    auto dynamic_rules = [&]() {
+        std::lock_guard<std::mutex> lock(g_dynamic_rules_mutex);
+        return g_dynamic_rules;
+    }();
+    if (!dynamic_rules) dynamic_rules = std::make_shared<std::vector<yuzu::vuln::CveRuleDynamic>>();
+    for (const auto& r : *dynamic_rules)
+        match_rule(r.product, r.affected_below, r.severity, r.cve_id, r.description, r.fixed_in, r.affected_inclusive);
+
+    return findings;
+}
+
+// ── Config scan (CIS Level 1 benchmarks) ──────────────────────────────────
 
 std::vector<Finding> do_config_scan_impl() {
     std::vector<Finding> findings;
-    auto checks = yuzu::vuln::run_all_config_checks();
+    auto checks = yuzu::vuln::run_all_cis_checks();
 
-    for (const auto& check : checks) {
-        // Report all checks (passed ones as INFO)
+    for (const auto& c : checks) {
         findings.push_back(
-            {std::string(check.severity), "config", std::string(check.title), check.detail});
+            {c.status == "FAIL" ? c.severity : std::string("INFO"),
+             "config",
+             c.check_id + ": " + c.title,
+             "status=" + c.status +
+                 " expected=" + escape_pipes(c.expected) +
+                 " actual="   + escape_pipes(c.actual)});
+    }
+
+    return findings;
+}
+
+// ── Language package scan (npm, pip, cargo, gem, NuGet) ─────────────────────
+
+std::vector<Finding> do_pkg_scan_impl() {
+    std::vector<Finding> findings;
+    auto pkgs = yuzu::vuln::get_lang_packages();
+
+    // Safely copy dynamic rules ptr while holding lock
+    auto dynamic = [&]() {
+        std::lock_guard<std::mutex> lock(g_dynamic_rules_mutex);
+        return g_dynamic_rules;
+    }();
+    if (!dynamic)
+        return findings;
+
+    // Match language packages against ecosystem-tagged rules
+    for (const auto& pkg : pkgs) {
+        for (const auto& rule : *dynamic) {
+            // Skip rules without an ecosystem (those are OS-native, handled by cve_scan)
+            if (rule.ecosystem.empty())
+                continue;
+
+            // Only match if ecosystems agree
+            if (pkg.ecosystem != rule.ecosystem)
+                continue;
+
+            // Case-insensitive substring match on package name
+            if (!icontains(pkg.name, rule.product) || pkg.version.empty())
+                continue;
+
+            // Version comparison
+            if (yuzu::vuln::compare_versions_normalized(pkg.version,
+                                                        rule.affected_below) < 0) {
+                findings.push_back(
+                    {rule.severity, "lang-pkg",
+                     std::format("{}: {}", rule.cve_id, rule.description),
+                     std::format("{} {} {} (fixed in {})", rule.ecosystem, pkg.name, pkg.version,
+                                 rule.fixed_in)});
+            }
+        }
     }
 
     return findings;
@@ -424,12 +610,30 @@ public:
     }
 
     const char* const* actions() const noexcept override {
-        static const char* acts[] = {"scan",    "cve_scan",  "config_scan",
-                                     "summary", "inventory", nullptr};
+        static const char* acts[] = {"scan",        "cve_scan",   "config_scan",
+                                     "summary",     "inventory",  "update_rules",
+                                     "kernel_scan", "binary_scan", "pkg_scan", nullptr};
         return acts;
     }
 
-    yuzu::Result<void> init(yuzu::PluginContext& /*ctx*/) override { return {}; }
+    yuzu::Result<void> init(yuzu::PluginContext& ctx) override {
+        g_data_dir = std::string(ctx.get_config("agent.data_dir"));
+        if (!g_data_dir.empty()) {
+            auto rules_path = g_data_dir + "/staged/cve_rules.json";
+            // Verify SHA-256 before loading (prevents tampering)
+            if (!verify_rules_sha256(rules_path))
+                return {};  // Non-fatal: compiled-in rules remain active
+            std::vector<yuzu::vuln::CveRuleDynamic> loaded;
+            auto err = yuzu::vuln::load_rules_from_json(rules_path, loaded);
+            if (err.empty()) {
+                std::lock_guard<std::mutex> lock(g_dynamic_rules_mutex);
+                g_dynamic_rules = std::make_shared<std::vector<yuzu::vuln::CveRuleDynamic>>(std::move(loaded));
+                ctx.storage_set("rules.last_loaded", rules_path);
+            }
+            // Non-fatal: compiled-in rules remain active if file not present
+        }
+        return {};
+    }
 
     void shutdown(yuzu::PluginContext& /*ctx*/) noexcept override {}
 
@@ -440,12 +644,15 @@ public:
             ctx.report_progress(0);
             auto cve_findings = do_cve_scan_impl();
             ctx.report_progress(50);
+            auto pkg_findings = do_pkg_scan_impl();
+            ctx.report_progress(70);
             auto config_findings = do_config_scan_impl();
             ctx.report_progress(90);
 
             std::vector<Finding> all;
-            all.reserve(cve_findings.size() + config_findings.size());
+            all.reserve(cve_findings.size() + pkg_findings.size() + config_findings.size());
             all.insert(all.end(), cve_findings.begin(), cve_findings.end());
+            all.insert(all.end(), pkg_findings.begin(), pkg_findings.end());
             all.insert(all.end(), config_findings.begin(), config_findings.end());
 
             output_findings(ctx, all);
@@ -482,14 +689,104 @@ public:
 
         if (action == "summary") {
             auto cve_findings = do_cve_scan_impl();
+            auto pkg_findings = do_pkg_scan_impl();
             auto config_findings = do_config_scan_impl();
 
             std::vector<Finding> all;
-            all.reserve(cve_findings.size() + config_findings.size());
+            all.reserve(cve_findings.size() + pkg_findings.size() + config_findings.size());
             all.insert(all.end(), cve_findings.begin(), cve_findings.end());
+            all.insert(all.end(), pkg_findings.begin(), pkg_findings.end());
             all.insert(all.end(), config_findings.begin(), config_findings.end());
 
             output_summary(ctx, all);
+            return 0;
+        }
+
+        if (action == "update_rules") {
+            auto rules_path = g_data_dir + "/staged/cve_rules.json";
+            // Verify SHA-256 before loading
+            if (!verify_rules_sha256(rules_path)) {
+                ctx.write_output("ERROR|update_rules|Verification failed|SHA-256 mismatch or missing .sha256 sidecar");
+                return 1;
+            }
+            std::vector<yuzu::vuln::CveRuleDynamic> loaded;
+            auto err = yuzu::vuln::load_rules_from_json(rules_path, loaded);
+            if (!err.empty()) {
+                ctx.write_output("ERROR|update_rules|Load failed|" + escape_pipes(err));
+                return 1;
+            }
+            size_t count = loaded.size();
+            {
+                std::lock_guard<std::mutex> lock(g_dynamic_rules_mutex);
+                g_dynamic_rules = std::make_shared<std::vector<yuzu::vuln::CveRuleDynamic>>(std::move(loaded));
+            }
+            ctx.write_output("INFO|update_rules|Rules loaded|" + std::to_string(count) + " rules active");
+            return 0;
+        }
+
+        if (action == "kernel_scan") {
+            ctx.report_progress(0);
+            auto findings = do_kernel_scan_impl();
+            output_findings(ctx, findings);
+            ctx.report_progress(100);
+            return 0;
+        }
+
+        if (action == "binary_scan") {
+            // Binary scan checks file-level versions against CVE rules.
+            // On Linux: strips Debian epoch from dpkg reported versions before compare.
+            // On Windows: reads PE VERSIONINFO resource from high-value binaries.
+            // On macOS: reads CFBundleShortVersionString from .app plists.
+            //
+            // The default high-value binary list is platform-specific.
+            // Callers may pass a comma-separated 'paths' parameter to override.
+            auto paths_param = std::string(params.get("paths", ""));
+            auto apps = get_installed_apps();
+
+            std::vector<Finding> findings;
+            for (const auto& app : apps) {
+                if (app.version.empty())
+                    continue;
+
+                // Strip Debian epoch from package-manager reported version for
+                // accurate comparison (e.g. "2:1.0.1f" → "1.0.1f")
+                auto clean_ver = yuzu::vuln::strip_linux_pkg_epoch(app.version);
+
+                auto match_rule = [&](std::string_view product, std::string_view affected_below,
+                                      std::string_view severity, std::string_view cve_id,
+                                      std::string_view description, std::string_view fixed_in, bool affected_inclusive) {
+                    if (!icontains(app.name, product))
+                        return;
+                    int cmp = yuzu::vuln::compare_versions_normalized(clean_ver, std::string(affected_below));
+                    if (cmp < 0 || (cmp == 0 && affected_inclusive)) {
+                        findings.push_back(
+                            {std::string(severity), "binary",
+                             std::format("{}: {}", cve_id, description),
+                             std::format("{} {} (fixed in {})", app.name, clean_ver, fixed_in)});
+                    }
+                };
+
+                for (const auto& r : yuzu::vuln::kCveRules)
+                    match_rule(r.product, r.affected_below, r.severity,
+                               r.cve_id, r.description, r.fixed_in, r.affected_inclusive);
+                // Safely access dynamic rules
+    auto dynamic_rules = [&]() {
+        std::lock_guard<std::mutex> lock(g_dynamic_rules_mutex);
+        return g_dynamic_rules;
+    }();
+    if (!dynamic_rules) dynamic_rules = std::make_shared<std::vector<yuzu::vuln::CveRuleDynamic>>();
+    for (const auto& r : *dynamic_rules)
+                    match_rule(r.product, r.affected_below, r.severity,
+                               r.cve_id, r.description, r.fixed_in, r.affected_inclusive);
+            }
+            output_findings(ctx, findings);
+            return 0;
+        }
+
+        if (action == "pkg_scan") {
+            ctx.write_output("INFO|scan|Starting language package scan|");
+            auto findings = do_pkg_scan_impl();
+            output_findings(ctx, findings);
             return 0;
         }
 
